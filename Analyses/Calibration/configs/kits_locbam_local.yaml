@@ -1,0 +1,27 @@
+# Local KiTS23 LocBAM run on Apple Silicon, using ~/Desktop/proposal_idea/locbam_repro/train.py unchanged.
+# Location context = 3 coordinate channels (AddCoordinateChannelsd dims 0,1,2), NOT the paper's BPR channel.
+# Intensity window comes from locbam_repro/data.py (-175..250 HU, not the KiTS script's -58..302).
+# Settings otherwise follow BasicUNet/kits_loc_context_cleaned_files.py with -ps small.
+name: kits_locbam_local_fold0
+arch: locbam
+datalist: /Users/j0sep/precision_LocBAM/data/kits_json/kits_local_train_fold0.json
+results_root: /Users/j0sep/precision_LocBAM/data/checkpoints/runs
+num_classes: 4
+spacing: [1.5, 1.5, 1.5]
+patch_size: [32, 32, 32]
+effective_batch_size: 128
+max_sample_size: 2
+lr: 0.01
+momentum: 0.99
+weight_decay: 3.0e-5
+grad_clip: 12
+poly_power: 0.9
+sched_steps: 1000
+dropout: 0.1
+amp: false
+seed: 0
+device: auto
+cache_workers: 8
+resume: true
+max_iterations: 5000
+eval_num: 500

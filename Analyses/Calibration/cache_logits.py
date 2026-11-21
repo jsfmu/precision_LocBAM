@@ -124,6 +124,29 @@ def get_val_transforms():
     )
 
 
+def get_coords_val_transforms():
+    """Validation preprocessing of the local Mac-trained model (configs/kits_locbam_local.yaml),
+    copied from ~/Desktop/proposal_idea/locbam_repro/data.py get_val_transforms("CoordConv"):
+    1-channel CT, window -175..250 HU, and x/y/z coordinate channels instead of BPR."""
+    return Compose(
+        [
+            LoadImaged(keys=["image", "label"], ensure_channel_first=True, image_only=True),
+            ScaleIntensityRanged(keys=["image"], a_min=-175, a_max=250, b_min=0.0, b_max=1.0, clip=True),
+            CropForegroundd(keys=["image", "label"], source_key="image", allow_smaller=False),
+            Orientationd(keys=["image", "label"], axcodes="RAS"),
+            Spacingd(keys=["image", "label"], pixdim=(1.5, 1.5, 1.5), mode=("bilinear", "nearest")),
+            AddCoordinateChannelsd(keys=["image"], spatial_dims=[0, 1, 2]),
+            EnsureTyped(keys=["image", "label"], track_meta=False),
+        ]
+    )
+
+
+PREPROCESSING = {
+    "kits_bpr": (get_val_transforms, PREPROCESSING_VERSION),
+    "coords": (get_coords_val_transforms, "kits_locbam_coords_val_v1"),
+}
+
+
 def sha256_file(path, chunk=1 << 20):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -168,8 +191,9 @@ def resolve_device(name):
 
 
 def case_id_of(path):
-    m = re.search(r"(\d{5})", Path(path).name)
-    return f"case_{m.group(1)}" if m else Path(path).name.split(".")[0]
+    # search the whole path: KiTS23 stores cases as case_00012/imaging.nii.gz (no digits in the filename)
+    m = re.findall(r"(\d{5})", str(path))
+    return f"case_{m[-1]}" if m else Path(path).name.split(".")[0]
 
 
 def remap(path, prefixes):
@@ -247,7 +271,10 @@ def main():
     ap.add_argument("--amp", action="store_true", help="fp16 autocast on CUDA, as in training validation")
     ap.add_argument("--device", default="auto", help="auto | cuda | mps | cpu")
     ap.add_argument("--overwrite", action="store_true", help="recompute cases already in the cache")
+    ap.add_argument("--preprocessing", choices=PREPROCESSING, default="kits_bpr",
+                    help="kits_bpr: paper's CT+BPR model; coords: the locally trained model (x/y/z channels)")
     args = ap.parse_args()
+    make_transforms, preproc_version = PREPROCESSING[args.preprocessing]
 
     device = resolve_device(args.device)
     patch_size, train_batch = PATCH_SIZES[args.patch_size]
@@ -262,7 +289,7 @@ def main():
         "checkpoint_sha256": ckpt_hash,
         "fold_json": str(Path(args.fold_json).resolve()),
         "fold_json_sha256": sha256_file(args.fold_json),
-        "preprocessing_version": PREPROCESSING_VERSION,
+        "preprocessing_version": preproc_version,
         "patch_size": list(patch_size),
         "sw_batch_size": sw_batch,
         "overlap": args.overlap,
@@ -286,7 +313,7 @@ def main():
         run["cases"] = prev.get("cases", {})
 
     model = load_model(args.checkpoint, device)
-    transforms = get_val_transforms()
+    transforms = make_transforms()
     cases = load_cases(args.fold_json, args.base_dir, args.remap_prefix, set(args.cases or []))
     if args.limit:
         cases = cases[: args.limit]
