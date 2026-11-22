@@ -1,5 +1,9 @@
 {
   "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/BasicUNet",
+    "${workspaceFolder}/BasicUNet/LocBAM"
+  ],
   "jupyter.kernels.excludePythonEnvironments": [
     "/Users/j0sep/.local/share/uv/python/cpython-3.11.17-macos-aarch64-none/bin/python"
   ]
