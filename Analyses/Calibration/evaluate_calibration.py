@@ -1,21 +1,23 @@
 """Step 3: before/after calibration evaluation on the TEST patients only.
 
-Reads <cache>/split.json and <cache>/temperature.json written by fit_temperature.py, and compares
-T = 1 (raw softmax) against the fitted T on every test case, using all voxels (no subsampling).
+Compares the raw softmax ("T1") against every calibrator fitted by fit_temperature.py on the
+calibration patients: temperature.json plus every calib_*.json in the cache (or those given with
+--calibrators). All test voxels are used, no subsampling.
 
 Per case it accumulates sufficient statistics (histograms and sums), so pooled metrics are exact and
-the patient-level bootstrap only re-sums per-case arrays instead of re-reading volumes.
+the patient-level bootstrap only re-sums per-case arrays instead of re-reading volumes. The bootstrap
+is paired: every calibrator is scored on the same resampled patients, so differences are tight.
 
-Metrics, for both temperatures:
-  - NLL and Brier (multiclass, mean over voxels), over all voxels and over the "foreground region"
-    (voxels where ground truth or argmax prediction is not background)
-  - top-label ECE (confidence = max_k p_k, correct = argmax == label)
-  - class-wise ECE for kidney / tumor / cyst (one-vs-rest p_k against [label == k])
-  - per-class threshold sweeps: precision / recall / Dice of the mask p_k >= t for t = 0.00 ... 1.00
-  - argmax Dice per class (must be identical for both temperatures: T > 0 cannot change the argmax)
-  - patient-level bootstrap 95% CIs for every pooled scalar and for the after - before difference
+Two voxel sets are reported:
+  all  every voxel of the cropped volume (>99% background; ECE here is near 0 for any model)
+  fg   the organ region: voxels whose label OR raw (uncalibrated) argmax is not background. The region
+       is fixed by the raw argmax, so every calibrator is scored on exactly the same voxels.
 
-Writes <cache>/metrics.json and, with --plots, <cache>/reliability.png and <cache>/threshold_sweeps.png.
+Metrics per calibrator: NLL, Brier, top-label ECE, class-wise ECE (each on all and fg), per-class
+threshold sweeps (precision / recall / Dice of p_k >= t), and argmax Dice. Temperature scaling cannot
+change the argmax (checked); vector scaling can, so its Dice is reported separately.
+
+Writes <cache>/metrics.json and, with --plots, <cache>/reliability_fg.png and <cache>/threshold_sweeps.png.
 """
 import argparse
 import json
@@ -26,6 +28,8 @@ import numpy as np
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--cache", required=True, help="data/cache/<hash> folder from cache_logits.py")
+ap.add_argument("--calibrators", nargs="*", default=None,
+                help="calibrator JSON names inside --cache (default: temperature.json + all calib_*.json)")
 ap.add_argument("--ece-bins", type=int, default=15)
 ap.add_argument("--sweep-bins", type=int, default=100, help="threshold resolution: t = j / sweep_bins")
 ap.add_argument("--bootstrap", type=int, default=1000)
@@ -36,64 +40,91 @@ a = ap.parse_args()
 cache = Path(a.cache)
 
 split = json.load(open(cache / "split.json"))
-temp = json.load(open(cache / "temperature.json"))
 run = json.load(open(cache / "run.json"))
 assert not set(split["calibration"]) & set(split["test"]), "calibration and test patients overlap"
-assert temp.get("split") == "split.json", "temperature.json was not fitted on this split.json"
+
+files = a.calibrators
+if files is None:
+    files = (["temperature.json"] if (cache / "temperature.json").exists() else []) + \
+            sorted(p.name for p in cache.glob("calib_*.json"))
+CALS = {"T1": {"method": "temperature", "T": 1.0}}
+for fn in files:
+    d = json.load(open(cache / fn))
+    d.setdefault("method", "temperature")
+    d.setdefault("region", "all")
+    assert d.get("split") == "split.json" and d.get("seed", split["seed"]) == split["seed"], \
+        f"{fn} was not fitted on this split.json"
+    CALS[Path(fn).stem] = d
+NAMES = list(CALS)
+OTHERS = NAMES[1:]
 
 LABELS = {int(k): v for k, v in run["label_map"].items()}
 K = len(LABELS)
 FG = [k for k in LABELS if k != 0]
-TEMPS = {"T1": 1.0, "Tfit": float(temp["T"])}
 EB, SB = a.ece_bins, a.sweep_bins
-print(f"test cases: {len(split['test'])}   temperatures: {TEMPS}   label_map_confirmed: {run.get('label_map_confirmed')}")
+desc = {n: (f"T={c['T']:.4f}" if c["method"] == "temperature" else "vector w,b") + f", fit on {c.get('region', '-')}"
+        for n, c in CALS.items()}
+print(f"test cases: {len(split['test'])}   label_map_confirmed: {run.get('label_map_confirmed')}")
+for n in NAMES:
+    print(f"  {n:<26} {desc[n]}")
+
+
+def scores(z, cal):
+    """z (K, n) float32 raw logits -> calibrated scores whose softmax is the calibrated probability."""
+    if cal["method"] == "temperature":
+        return z / np.float32(cal["T"])
+    w = np.asarray(cal["w"], dtype=np.float32)[:, None]
+    b = np.asarray(cal["b"], dtype=np.float32)[:, None]
+    return z * w + b
 
 
 def empty_stats():
-    return {
-        "n": 0, "nll": 0.0, "brier": 0.0, "n_fg": 0, "nll_fg": 0.0, "brier_fg": 0.0,
-        "top_cnt": np.zeros(EB), "top_sp": np.zeros(EB), "top_sy": np.zeros(EB),
-        "cls_cnt": np.zeros((K, EB)), "cls_sp": np.zeros((K, EB)), "cls_sy": np.zeros((K, EB)),
-        "sw_pos": np.zeros((K, SB + 1)), "sw_neg": np.zeros((K, SB + 1)),
-    }
+    s = {"n": 0.0, "nll": 0.0, "brier": 0.0, "n_fg": 0.0, "nll_fg": 0.0, "brier_fg": 0.0}
+    for reg in ("", "f"):
+        for q in ("cnt", "sp", "sy"):
+            s[f"{reg}top_{q}"] = np.zeros(EB)
+            s[f"{reg}cls_{q}"] = np.zeros((K, EB))
+    s["sw_pos"] = np.zeros((K, SB + 1))
+    s["sw_neg"] = np.zeros((K, SB + 1))
+    return s
 
 
-def accumulate(s, logits, label, T):
-    """logits (K, n) float32, label (n,) int. Adds this chunk's statistics into s."""
-    z = logits / T
-    z -= z.max(axis=0, keepdims=True)
+def accumulate(s, z, label, fgmask):
+    """z (K, n) calibrated scores, label (n,), fgmask (n,) bool. Adds this chunk's statistics into s."""
+    z = z - z.max(axis=0, keepdims=True)
     e = np.exp(z)
     se = e.sum(axis=0)
     p = e / se
     n = label.size
     ar = np.arange(n)
     logp_y = z[label, ar] - np.log(se)
-    onehot = np.zeros_like(p)
-    onehot[label, ar] = 1.0
-    brier = ((p - onehot) ** 2).sum(axis=0)
+    p_true = p[label, ar]
+    brier = (p ** 2).sum(axis=0) - 2 * p_true + 1.0
     pred = p.argmax(axis=0)
-    fg = (label != 0) | (pred != 0)
 
     s["n"] += n
     s["nll"] += float(-logp_y.sum())
     s["brier"] += float(brier.sum())
-    s["n_fg"] += int(fg.sum())
-    s["nll_fg"] += float(-logp_y[fg].sum())
-    s["brier_fg"] += float(brier[fg].sum())
+    s["n_fg"] += int(fgmask.sum())
+    s["nll_fg"] += float(-logp_y[fgmask].sum())
+    s["brier_fg"] += float(brier[fgmask].sum())
 
+    # top-label
     conf = p[pred, ar]
     b = np.minimum((conf * EB).astype(np.int64), EB - 1)
-    s["top_cnt"] += np.bincount(b, minlength=EB)
-    s["top_sp"] += np.bincount(b, weights=conf, minlength=EB)
-    s["top_sy"] += np.bincount(b, weights=(pred == label), minlength=EB)
-
+    for reg, m in (("", slice(None)), ("f", fgmask)):
+        s[f"{reg}top_cnt"] += np.bincount(b[m], minlength=EB)
+        s[f"{reg}top_sp"] += np.bincount(b[m], weights=conf[m], minlength=EB)
+        s[f"{reg}top_sy"] += np.bincount(b[m], weights=(pred == label)[m], minlength=EB)
+    # class-wise and threshold sweeps
     for k in range(K):
         pk = p[k]
         yk = label == k
         b = np.minimum((pk * EB).astype(np.int64), EB - 1)
-        s["cls_cnt"][k] += np.bincount(b, minlength=EB)
-        s["cls_sp"][k] += np.bincount(b, weights=pk, minlength=EB)
-        s["cls_sy"][k] += np.bincount(b, weights=yk, minlength=EB)
+        for reg, m in (("", slice(None)), ("f", fgmask)):
+            s[f"{reg}cls_cnt"][k] += np.bincount(b[m], minlength=EB)
+            s[f"{reg}cls_sp"][k] += np.bincount(b[m], weights=pk[m], minlength=EB)
+            s[f"{reg}cls_sy"][k] += np.bincount(b[m], weights=yk[m], minlength=EB)
         sb = np.minimum(np.floor(pk * SB + 1e-9).astype(np.int64), SB)
         s["sw_pos"][k] += np.bincount(sb[yk], minlength=SB + 1)
         s["sw_neg"][k] += np.bincount(sb[~yk], minlength=SB + 1)
@@ -106,30 +137,32 @@ t0 = time.time()
 for i, cid in enumerate(split["test"]):
     z = np.load(cache / f"{cid}.npz")
     L, Y = z["logits"], z["label"]  # (K, X, Y, Z) fp16, (X, Y, Z) uint8
-    stats = {t: empty_stats() for t in TEMPS}
-    conf_mat = {t: np.zeros((K, K), dtype=np.int64) for t in TEMPS}  # [label, pred]
+    stats = {c: empty_stats() for c in NAMES}
+    conf_mat = {c: np.zeros((K, K), dtype=np.int64) for c in NAMES}  # [label, pred]
     for x0 in range(0, Y.shape[0], a.slab):
         lg = L[:, x0:x0 + a.slab].reshape(K, -1).astype(np.float32)
         lb = Y[x0:x0 + a.slab].reshape(-1).astype(np.int64)
-        for t, T in TEMPS.items():
-            pred = accumulate(stats[t], lg, lb, T)
-            conf_mat[t] += np.bincount(lb * K + pred, minlength=K * K).reshape(K, K)
-    assert np.array_equal(conf_mat["T1"], conf_mat["Tfit"]), f"{cid}: argmax changed with T (bug)"
-    per_case[cid] = {"stats": stats, "conf": conf_mat["T1"]}
+        fgmask = (lb != 0) | (lg.argmax(axis=0) != 0)  # fixed by the RAW argmax
+        for c in NAMES:
+            pred = accumulate(stats[c], scores(lg, CALS[c]), lb, fgmask)
+            conf_mat[c] += np.bincount(lb * K + pred, minlength=K * K).reshape(K, K)
+    for c in NAMES:
+        if CALS[c]["method"] == "temperature":
+            assert np.array_equal(conf_mat["T1"], conf_mat[c]), f"{cid}: argmax changed under {c} (bug)"
+    per_case[cid] = {"stats": stats, "conf": conf_mat}
     print(f"[{i + 1}/{len(split['test'])}] {cid}  {Y.size:,} voxels  {time.time() - t0:.0f}s", flush=True)
 
 
 # ---------------------------------------------------------------- metrics from summed statistics
 def ece(cnt, sp, sy):
     n = cnt.sum()
-    m = cnt > 0
-    return float(np.sum(np.abs(sy[m] - sp[m])) / n) if n else None  # sum_b |sum y - sum p| / N
+    return float(np.sum(np.abs(sy - sp)) / n) if n else None  # sum_b |sum y - sum p| / N
 
 
-def summarize(cases, t):
+def summarize(cases, c):
     s = empty_stats()
-    for c in cases:
-        cs = per_case[c]["stats"][t]
+    for cid in cases:
+        cs = per_case[cid]["stats"][c]
         for k in s:
             s[k] = s[k] + cs[k]
     out = {
@@ -137,9 +170,11 @@ def summarize(cases, t):
         "nll_fg": s["nll_fg"] / s["n_fg"] if s["n_fg"] else None,
         "brier_fg": s["brier_fg"] / s["n_fg"] if s["n_fg"] else None,
         "ece_top": ece(s["top_cnt"], s["top_sp"], s["top_sy"]),
+        "ece_top_fg": ece(s["ftop_cnt"], s["ftop_sp"], s["ftop_sy"]),
     }
     for k in FG:
         out[f"ece_{LABELS[k]}"] = ece(s["cls_cnt"][k], s["cls_sp"][k], s["cls_sy"][k])
+        out[f"ece_{LABELS[k]}_fg"] = ece(s["fcls_cnt"][k], s["fcls_sp"][k], s["fcls_sy"][k])
     return out, s
 
 
@@ -157,10 +192,9 @@ def sweep(pos, neg):
         prec = np.where(tp + fp > 0, tp / (tp + fp), np.nan)
         rec = np.where(pos.sum() > 0, tp / pos.sum(), np.nan)
         dice = np.where(2 * tp + fp + fn > 0, 2 * tp / (2 * tp + fp + fn), np.nan)
+    nn = lambda v: None if np.isnan(v) else float(v)
     rows = [{"t": j / SB, "tp": int(tp[j]), "fp": int(fp[j]), "fn": int(fn[j]),
-             "precision": None if np.isnan(prec[j]) else float(prec[j]),
-             "recall": None if np.isnan(rec[j]) else float(rec[j]),
-             "dice": None if np.isnan(dice[j]) else float(dice[j])} for j in range(SB + 1)]
+             "precision": nn(prec[j]), "recall": nn(rec[j]), "dice": nn(dice[j])} for j in range(SB + 1)]
     best = int(np.nanargmax(dice)) if np.any(~np.isnan(dice)) else None
     return rows, (rows[best] if best is not None else None)
 
@@ -175,19 +209,20 @@ def dice_from_conf(C):
 
 test = split["test"]
 pooled, sums = {}, {}
-for t in TEMPS:
-    pooled[t], sums[t] = summarize(test, t)
-
-# patient-level bootstrap (resample test patients with replacement)
-rng = np.random.default_rng(a.seed)
+for c in NAMES:
+    pooled[c], sums[c] = summarize(test, c)
 keys = list(pooled["T1"].keys())
-boot = {t: {k: [] for k in keys} for t in TEMPS}
+
+# paired patient-level bootstrap (resample test patients with replacement; same sample for every calibrator)
+rng = np.random.default_rng(a.seed)
+boot = {c: {k: [] for k in keys + ["dice_" + LABELS[j] for j in FG]} for c in NAMES}
 for _ in range(a.bootstrap):
     sample = list(rng.choice(test, size=len(test), replace=True))
-    for t in TEMPS:
-        r, _ = summarize(sample, t)
-        for k in keys:
-            boot[t][k].append(r[k])
+    for c in NAMES:
+        r, _ = summarize(sample, c)
+        r.update({"dice_" + k: v for k, v in dice_from_conf(sum(per_case[x]["conf"][c] for x in sample)).items()})
+        for k in boot[c]:
+            boot[c][k].append(r[k])
 
 
 def ci(v):
@@ -195,45 +230,58 @@ def ci(v):
     return [float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5))] if v.size else None
 
 
+def delta(c, k):
+    return [None if x is None or y is None else y - x for x, y in zip(boot["T1"][k], boot[c][k])]
+
+
+dice_pooled = {c: dice_from_conf(sum(per_case[x]["conf"][c] for x in test)) for c in NAMES}
 result = {
-    "cache": str(cache), "checkpoint_sha256": run["checkpoint_sha256"], "temperatures": TEMPS,
-    "label_map": LABELS, "label_map_confirmed": run.get("label_map_confirmed"),
+    "cache": str(cache), "checkpoint_sha256": run["checkpoint_sha256"],
+    "calibrators": CALS, "label_map": LABELS, "label_map_confirmed": run.get("label_map_confirmed"),
     "n_test_cases": len(test), "test_cases": test, "ece_bins": EB, "sweep_bins": SB,
     "bootstrap": a.bootstrap, "seed": a.seed,
-    "pooled": {t: {k: {"value": pooled[t][k], "ci95": ci(boot[t][k])} for k in keys} for t in TEMPS},
-    "delta_Tfit_minus_T1": {k: {"value": None if pooled["T1"][k] is None else pooled["Tfit"][k] - pooled["T1"][k],
-                                "ci95": ci([None if x is None or y is None else y - x
-                                            for x, y in zip(boot["T1"][k], boot["Tfit"][k])])} for k in keys},
-    "reliability": {t: {"top_label": reliability(sums[t]["top_cnt"], sums[t]["top_sp"], sums[t]["top_sy"]),
-                        **{LABELS[k]: reliability(sums[t]["cls_cnt"][k], sums[t]["cls_sp"][k], sums[t]["cls_sy"][k])
-                           for k in FG}} for t in TEMPS},
+    "fg_region": "label != background OR raw (T=1) argmax != background; identical voxels for every calibrator",
+    "pooled": {c: {k: {"value": pooled[c][k], "ci95": ci(boot[c][k])} for k in keys} for c in NAMES},
+    "delta_vs_T1": {c: {k: {"value": None if pooled["T1"][k] is None else pooled[c][k] - pooled["T1"][k],
+                            "ci95": ci(delta(c, k))} for k in keys} for c in OTHERS},
+    "argmax_dice_pooled": {c: {k: {"value": v, "ci95": ci(boot[c]["dice_" + k])} for k, v in dice_pooled[c].items()}
+                           for c in NAMES},
+    "delta_dice_vs_T1": {c: {k: {"value": None if dice_pooled["T1"][k] is None else dice_pooled[c][k] - dice_pooled["T1"][k],
+                                 "ci95": ci(delta(c, "dice_" + k))} for k in dice_pooled[c]} for c in OTHERS},
+    "reliability": {c: {reg: {"top_label": reliability(sums[c][f"{p}top_cnt"], sums[c][f"{p}top_sp"], sums[c][f"{p}top_sy"]),
+                              **{LABELS[k]: reliability(sums[c][f"{p}cls_cnt"][k], sums[c][f"{p}cls_sp"][k], sums[c][f"{p}cls_sy"][k])
+                                 for k in FG}}
+                        for reg, p in (("all", ""), ("fg", "f"))} for c in NAMES},
     "threshold_sweeps": {}, "best_threshold_on_test_DO_NOT_REPORT_AS_TUNED": {},
-    "argmax_dice_pooled": dice_from_conf(sum(per_case[c]["conf"] for c in test)),
     "per_case": {},
 }
-for t in TEMPS:
-    result["threshold_sweeps"][t], result["best_threshold_on_test_DO_NOT_REPORT_AS_TUNED"][t] = {}, {}
+for c in NAMES:
+    result["threshold_sweeps"][c], result["best_threshold_on_test_DO_NOT_REPORT_AS_TUNED"][c] = {}, {}
     for k in FG:
-        rows, best = sweep(sums[t]["sw_pos"][k], sums[t]["sw_neg"][k])
-        result["threshold_sweeps"][t][LABELS[k]] = rows
-        result["best_threshold_on_test_DO_NOT_REPORT_AS_TUNED"][t][LABELS[k]] = best
-for c in test:
-    result["per_case"][c] = {"argmax_dice": dice_from_conf(per_case[c]["conf"]),
-                             **{t: summarize([c], t)[0] for t in TEMPS}}
+        rows, best = sweep(sums[c]["sw_pos"][k], sums[c]["sw_neg"][k])
+        result["threshold_sweeps"][c][LABELS[k]] = rows
+        result["best_threshold_on_test_DO_NOT_REPORT_AS_TUNED"][c][LABELS[k]] = best
+for x in test:
+    result["per_case"][x] = {c: {**summarize([x], c)[0], "argmax_dice": dice_from_conf(per_case[x]["conf"][c])}
+                             for c in NAMES}
 
 json.dump(result, open(cache / "metrics.json", "w"), indent=1)
 
 # ---------------------------------------------------------------- console summary
-print(f"\nT fitted = {TEMPS['Tfit']:.4f}   (pooled over {len(test)} test patients, 95% patient-bootstrap CI)")
-print(f"{'metric':<12}{'T=1':>28}{'T=fit':>28}{'fit - 1':>31}")
+print(f"\npooled over {len(test)} test patients; [95% paired patient-bootstrap CI]; * = CI of the change excludes 0")
+w = max(len(c) for c in NAMES) + 2
 for k in keys:
-    row = [result["pooled"][t][k] for t in TEMPS]
-    d = result["delta_Tfit_minus_T1"][k]
-    fmt = lambda r: "—" if r["value"] is None else f"{r['value']:.5f} [{r['ci95'][0]:.5f},{r['ci95'][1]:.5f}]"
-    dv = "—" if d["value"] is None else f"{d['value']:+.5f} [{d['ci95'][0]:+.5f},{d['ci95'][1]:+.5f}]"
-    print(f"{k:<12}{fmt(row[0]):>28}{fmt(row[1]):>28}{dv:>31}")
-print("argmax Dice (identical for both T):", {k: None if v is None else round(v, 4) for k, v in result["argmax_dice_pooled"].items()})
-print("wrote", cache / "metrics.json")
+    print(f"\n{k}")
+    print(f"  {'T1':<{w}}{pooled['T1'][k]:.5f}")
+    for c in OTHERS:
+        d = result["delta_vs_T1"][c][k]
+        lo, hi = d["ci95"]
+        sig = "*" if lo > 0 or hi < 0 else " "
+        print(f"  {c:<{w}}{pooled[c][k]:.5f}   change {d['value']:+.5f} [{lo:+.5f}, {hi:+.5f}] {sig}")
+print("\nargmax Dice")
+for c in NAMES:
+    print(f"  {c:<{w}}" + "  ".join(f"{k} {v['value']:.4f}" for k, v in result["argmax_dice_pooled"][c].items() if v["value"] is not None))
+print("\nwrote", cache / "metrics.json")
 
 # ---------------------------------------------------------------- optional figures
 if a.plots:
@@ -242,28 +290,27 @@ if a.plots:
     import matplotlib.pyplot as plt
 
     panels = ["top_label"] + [LABELS[k] for k in FG]
-    fig, axes = plt.subplots(1, len(panels), figsize=(4 * len(panels), 4), squeeze=False)
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.2 * len(panels), 4.4), squeeze=False)
     for ax, name in zip(axes[0], panels):
         ax.plot([0, 1], [0, 1], "--", color="grey", lw=1)
-        for t, style in zip(TEMPS, ["o-", "s-"]):
-            bins = [b for b in result["reliability"][t][name] if b["n"] > 0]
-            ax.plot([b["mean_p"] for b in bins], [b["freq"] for b in bins], style, ms=4,
-                    label=f"{t} (T={TEMPS[t]:.3f})")
-        key = "ece_top" if name == "top_label" else f"ece_{name}"
-        ax.set_title(f"{name}\nECE {pooled['T1'][key]:.4f} → {pooled['Tfit'][key]:.4f}")
+        for c in NAMES:
+            bins = [b for b in result["reliability"][c]["fg"][name] if b["n"] > 0]
+            ax.plot([b["mean_p"] for b in bins], [b["freq"] for b in bins], "o-", ms=3, label=c)
+        key = "ece_top_fg" if name == "top_label" else f"ece_{name}_fg"
+        ax.set_title(f"{name} (organ region)\n" + "  ".join(f"{pooled[c][key]:.3f}" for c in NAMES) + "  ECE", fontsize=9)
         ax.set_xlabel("mean predicted probability"); ax.set_ylabel("observed frequency")
-        ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.legend(fontsize=8)
-    fig.tight_layout(); fig.savefig(cache / "reliability.png", dpi=150)
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.legend(fontsize=7)
+    fig.tight_layout(); fig.savefig(cache / "reliability_fg.png", dpi=150)
 
-    fig, axes = plt.subplots(1, len(FG), figsize=(4 * len(FG), 4), squeeze=False)
+    fig, axes = plt.subplots(1, len(FG), figsize=(4.2 * len(FG), 4.2), squeeze=False)
     for ax, k in zip(axes[0], FG):
-        for t, ls in zip(TEMPS, ["-", "--"]):
-            rows = result["threshold_sweeps"][t][LABELS[k]]
-            ts = [r["t"] for r in rows]
-            for m, c in [("precision", "C0"), ("recall", "C1"), ("dice", "C2")]:
-                ax.plot(ts, [np.nan if r[m] is None else r[m] for r in rows], ls, color=c,
-                        label=f"{m} {t}" if k == FG[0] else None)
-        ax.set_title(LABELS[k]); ax.set_xlabel("threshold t on p_k"); ax.set_ylim(0, 1)
+        for c in NAMES:
+            rows = result["threshold_sweeps"][c][LABELS[k]]
+            ax.plot([r["t"] for r in rows], [np.nan if r["dice"] is None else r["dice"] for r in rows], label=f"Dice {c}")
+            ax.plot([r["t"] for r in rows], [np.nan if r["precision"] is None else r["precision"] for r in rows], ":", lw=1)
+            ax.plot([r["t"] for r in rows], [np.nan if r["recall"] is None else r["recall"] for r in rows], "--", lw=1)
+        ax.set_title(f"{LABELS[k]}: Dice (solid), precision (dotted), recall (dashed)", fontsize=8)
+        ax.set_xlabel("threshold t on p_k"); ax.set_ylim(0, 1)
     axes[0][0].legend(fontsize=7)
     fig.tight_layout(); fig.savefig(cache / "threshold_sweeps.png", dpi=150)
-    print("wrote", cache / "reliability.png", "and", cache / "threshold_sweeps.png")
+    print("wrote", cache / "reliability_fg.png", "and", cache / "threshold_sweeps.png")
