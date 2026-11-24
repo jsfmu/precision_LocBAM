@@ -15,7 +15,12 @@ Two voxel sets are reported:
 
 Metrics per calibrator: NLL, Brier, top-label ECE, class-wise ECE (each on all and fg), per-class
 threshold sweeps (precision / recall / Dice of p_k >= t), and argmax Dice. Temperature scaling cannot
-change the argmax (checked); vector scaling can, so its Dice is reported separately.
+change the argmax, nor can predclass (checked); classwise and vector scaling can, so Dice is reported
+per calibrator.
+
+Calibrators fitted with --region pred are two-region: applied only inside the predicted region (raw
+argmax != background, dilated by the calibrator's own `dilate`), identity (T = 1) everywhere else.
+That region needs no labels, so this is exactly what would run at inference time.
 
 Writes <cache>/metrics.json and, with --plots, <cache>/reliability_fg.png and <cache>/threshold_sweeps.png.
 """
@@ -25,6 +30,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+from scipy.ndimage import binary_dilation, generate_binary_structure
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--cache", required=True, help="data/cache/<hash> folder from cache_logits.py")
@@ -62,20 +68,47 @@ LABELS = {int(k): v for k, v in run["label_map"].items()}
 K = len(LABELS)
 FG = [k for k in LABELS if k != 0]
 EB, SB = a.ece_bins, a.sweep_bins
-desc = {n: (f"T={c['T']:.4f}" if c["method"] == "temperature" else "vector w,b") + f", fit on {c.get('region', '-')}"
-        for n, c in CALS.items()}
+def describe(c):
+    if c["method"] == "temperature":
+        s = f"T={c['T']:.4f}"
+    elif c["method"] == "classwise":
+        s = "T_k=" + ",".join(f"{t:.3f}" for t in c["T_per_class"])
+    elif c["method"] == "predclass":
+        s = "T_by_pred=" + ",".join(f"{t:.3f}" for t in c["T_by_pred_class"])
+    else:
+        s = "vector w,b"
+    reg = c.get("region", "-")
+    return s + (f", fit+applied in pred region (dilate {c['dilate']}), T=1 outside" if reg == "pred" else f", fit on {reg}")
+
+
 print(f"test cases: {len(split['test'])}   label_map_confirmed: {run.get('label_map_confirmed')}")
 for n in NAMES:
-    print(f"  {n:<26} {desc[n]}")
+    print(f"  {n:<26} {describe(CALS[n])}")
+DILATES = sorted({c["dilate"] for c in CALS.values() if c.get("region") == "pred"})
 
 
-def scores(z, cal):
+def transform(z, cal):
     """z (K, n) float32 raw logits -> calibrated scores whose softmax is the calibrated probability."""
     if cal["method"] == "temperature":
         return z / np.float32(cal["T"])
+    if cal["method"] == "classwise":
+        return z / np.asarray(cal["T_per_class"], dtype=np.float32)[:, None]
+    if cal["method"] == "predclass":  # z here is always the RAW logits, so argmax(z) is the raw prediction
+        return z / np.asarray(cal["T_by_pred_class"], dtype=np.float32)[z.argmax(axis=0)][None, :]
     w = np.asarray(cal["w"], dtype=np.float32)[:, None]
     b = np.asarray(cal["b"], dtype=np.float32)[:, None]
     return z * w + b
+
+
+def scores(z, cal, pred_regions):
+    """Apply cal to the whole chunk, or (region 'pred') only inside its predicted region, identity outside."""
+    if cal.get("region") != "pred":
+        return transform(z, cal)
+    m = pred_regions[cal["dilate"]]
+    out = z.copy()
+    if m.any():
+        out[:, m] = transform(z[:, m], cal)
+    return out
 
 
 def empty_stats():
@@ -139,15 +172,23 @@ for i, cid in enumerate(split["test"]):
     L, Y = z["logits"], z["label"]  # (K, X, Y, Z) fp16, (X, Y, Z) uint8
     stats = {c: empty_stats() for c in NAMES}
     conf_mat = {c: np.zeros((K, K), dtype=np.int64) for c in NAMES}  # [label, pred]
+    # predicted regions need the whole volume (dilation crosses slab borders), computed once per dilation
+    regions3d = {}
+    if DILATES:
+        raw_fg = L.argmax(axis=0) != 0
+        st = generate_binary_structure(3, 1)
+        for d in DILATES:
+            regions3d[d] = binary_dilation(raw_fg, structure=st, iterations=d) if d > 0 else raw_fg
     for x0 in range(0, Y.shape[0], a.slab):
         lg = L[:, x0:x0 + a.slab].reshape(K, -1).astype(np.float32)
         lb = Y[x0:x0 + a.slab].reshape(-1).astype(np.int64)
         fgmask = (lb != 0) | (lg.argmax(axis=0) != 0)  # fixed by the RAW argmax
+        pr = {d: r[x0:x0 + a.slab].reshape(-1) for d, r in regions3d.items()}
         for c in NAMES:
-            pred = accumulate(stats[c], scores(lg, CALS[c]), lb, fgmask)
+            pred = accumulate(stats[c], scores(lg, CALS[c], pr), lb, fgmask)
             conf_mat[c] += np.bincount(lb * K + pred, minlength=K * K).reshape(K, K)
     for c in NAMES:
-        if CALS[c]["method"] == "temperature":
+        if CALS[c]["method"] in ("temperature", "predclass"):
             assert np.array_equal(conf_mat["T1"], conf_mat[c]), f"{cid}: argmax changed under {c} (bug)"
     per_case[cid] = {"stats": stats, "conf": conf_mat}
     print(f"[{i + 1}/{len(split['test'])}] {cid}  {Y.size:,} voxels  {time.time() - t0:.0f}s", flush=True)
