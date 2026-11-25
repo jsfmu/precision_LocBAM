@@ -87,9 +87,11 @@ from kits_loc_context_cleaned_files import (  # noqa: E402  (top-level classes o
 )
 
 NUM_CLASSES = 4
-# KiTS23 convention. The notebook legend says "Kidney / Mass / Tumor": confirm before reporting class-wise results.
+# KiTS23 convention, confirmed against the official KiTS23 code: data/kits23/kits23/configuration/labels.py
+# L24-26 ({1: "kidney", 2: "tumor", 3: "cyst"}). segmentation.nii.gz is loaded without any label remapping.
+# (The notebook legend "Kidney / Mass / Tumor" is wrong for KiTS23.)
 LABEL_MAP = {0: "background", 1: "kidney", 2: "tumor", 3: "cyst"}
-LABEL_MAP_CONFIRMED = False
+LABEL_MAP_CONFIRMED = True
 # Cases the training script drops as corrupted.
 WRONG_FILE_IDS = ["00516", "00223", "00088", "00560"]
 PATCH_SIZES = {"small": ((32, 32, 32), 128), "large": ((128, 128, 128), 2)}

@@ -48,7 +48,15 @@ json.dump({**common, "training": [by_id[i] for i in train], "validation": [by_id
           open(out / f"kits_local_train_fold{a.fold}.json", "w"), indent=1)
 json.dump({**common, "training": [by_id[i] for i in train + monitor], "validation": [by_id[i] for i in heldout]},
           open(out / f"kits_fold{a.fold}_heldout.json", "w"), indent=1)
+# Cases this checkpoint never touched (not trained on, not used for model selection, not in the held-out
+# fold that calibration was fitted and explored on): the confirmation set for frozen calibrators.
+unused = sorted(pool[a.n_train + a.n_monitor:])
+json.dump({**common, "training": [by_id[i] for i in train + monitor], "validation": [by_id[i] for i in unused],
+           "note": "never used for training, model selection, calibration fitting or exploration"},
+          open(out / f"kits_fold{a.fold}_unused.json", "w"), indent=1)
 assert not set(heldout) & set(train + monitor)
+assert not set(unused) & (set(heldout) | set(train) | set(monitor))
+print(f"never used: {len(unused)} -> {out / f'kits_fold{a.fold}_unused.json'}")
 print(f"{len(cases)} cases -> train {len(train)}, monitor {len(monitor)}, held-out {len(heldout)} (fold {a.fold})")
 print("wrote", out / f"kits_local_train_fold{a.fold}.json")
 print("wrote", out / f"kits_fold{a.fold}_heldout.json")
