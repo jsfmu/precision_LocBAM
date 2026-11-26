@@ -4,6 +4,7 @@ The test patients are never read. Candidates are calibrators applied only inside
 (raw argmax != background, dilated by d voxels), identity (T = 1) everywhere else:
   temperature  one T for the whole region
   predclass    one T per predicted class (argmax-preserving)
+  isotonic     one monotone curve per (predicted class, class), renormalized (isotonic_map.py; CAN change argmax)
 
 Criterion: change in mean whole-volume NLL on held-out calibration patients (patient-level K-fold).
 NLL is a proper scoring rule; using the whole volume means a larger region is only rewarded if the
@@ -27,14 +28,17 @@ from scipy.ndimage import binary_dilation, generate_binary_structure
 from scipy.optimize import minimize_scalar
 from scipy.special import logsumexp
 
+import isotonic_map as iso
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--cache", required=True)
 ap.add_argument("--dilations", type=int, nargs="+", default=[0, 1, 2, 4, 8])
-ap.add_argument("--methods", nargs="+", default=["temperature", "predclass"], choices=["temperature", "predclass"])
+ap.add_argument("--methods", nargs="+", default=["temperature", "predclass"], choices=["temperature", "predclass", "isotonic"])
 ap.add_argument("--folds", type=int, default=5)
 ap.add_argument("--sample-per-case", type=int, default=400_000, help="voxels kept per patient from the largest region")
 ap.add_argument("--fit-per-case", type=int, default=100_000, help="voxels per training patient used in each fit")
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--out", default="calibrator_selection.json", help="output file name inside --cache")
 a = ap.parse_args()
 cache = Path(a.cache)
 D = sorted(a.dilations)
@@ -84,11 +88,28 @@ def fit_T(Z, Yv):
 
 
 def fit(method, Z, Yv):
+    if method == "isotonic":
+        return iso.fit(iso.add_stats(iso.empty_stats(Z.shape[1]), iso.softmax(Z.T), Yv))
     if method == "temperature":
         return {"T": fit_T(Z, Yv)}
     R = Z.argmax(axis=1)
     return {"T_by_pred_class": [fit_T(Z[R == k], Yv[R == k]) if (R == k).sum() >= 1000 else 1.0
                                 for k in range(Z.shape[1])]}
+
+
+def method_nll(method, params, Z, Yv):
+    """per-voxel NLL of the calibrated probabilities."""
+    if method == "isotonic":
+        S = iso.calibrated_scores(Z.T, params)  # (K, n) log-probabilities
+        return -S[Yv, np.arange(len(Yv))]
+    return nll_vec(Z, Yv, T_of(method, params, Z))
+
+
+def summary(method, params):
+    """what is kept in the JSON per fold (isotonic curves are too large to store 5 x dilations times)."""
+    if method == "isotonic":
+        return {"pred_class_counts": params["pred_class_counts"]}
+    return params
 
 
 def T_of(method, params, Z):
@@ -120,14 +141,14 @@ for f, held in enumerate(folds):
                 m = data[p]["lvl"] <= j
                 Zh, Yh = data[p]["z"][m].astype(np.float32), data[p]["y"][m]
                 if len(Yh):
-                    diff = float(np.mean(nll_vec(Zh, Yh, T_of(meth, params, Zh)) - nll_vec(Zh, Yh, 1.0)))
+                    diff = float(np.mean(method_nll(meth, params, Zh, Yh) - nll_vec(Zh, Yh, 1.0)))
                     num += diff * data[p]["sizes"][j]
                     num_r += diff * data[p]["sizes"][j]
                     n_r += data[p]["sizes"][j]
                 n_all += data[p]["N"]
             results[meth][d]["delta_nll_whole_volume"].append(num / n_all)
             results[meth][d]["delta_nll_region"].append(num_r / n_r if n_r else None)
-            results[meth][d]["params"].append(params)
+            results[meth][d]["params"].append(summary(meth, params))
     print(f"fold {f + 1}/{a.folds} done  {time.time() - t0:.0f}s", flush=True)
 
 # ---------------------------------------------------------------- choose
@@ -141,7 +162,9 @@ for meth in a.methods:
         mr = float(np.mean([x for x in r["delta_nll_region"] if x is not None]))
         r.update({"mean": mu, "sd": sd, "mean_region": mr})
         ps = r["params"][0]
-        pstr = f"{ps['T']:.3f}" if meth == "temperature" else ",".join(f"{t:.2f}" for t in ps["T_by_pred_class"])
+        pstr = (f"{ps['T']:.3f}" if meth == "temperature" else
+                "voxels by pred class " + ",".join(str(c) for c in ps["pred_class_counts"]) if meth == "isotonic" else
+                ",".join(f"{t:.2f}" for t in ps["T_by_pred_class"]))
         print(f"{meth:<12}{d:>7}{mu:>+20.6f}{sd:>10.6f}{mr:>+20.5f}   {pstr}")
         if best is None or mu < best[2]:
             best = (meth, d, mu)
@@ -152,7 +175,7 @@ json.dump({"criterion": "mean change in whole-volume NLL on held-out calibration
            "folds": folds, "dilations": D, "methods": a.methods, "seed": a.seed,
            "results": {m: {str(d): v for d, v in r.items()} for m, r in results.items()},
            "selected": {"method": meth, "dilate": d, "cv_delta_nll": mu, "fit_command": cmd}},
-          open(cache / "calibrator_selection.json", "w"), indent=1)
+          open(cache / a.out, "w"), indent=1)
 print(f"\nselected: method={meth} dilate={d} (CV delta {mu:+.6f})")
 print("fit it on all calibration patients with:\n  " + cmd)
-print("wrote", cache / "calibrator_selection.json")
+print("wrote", cache / a.out)

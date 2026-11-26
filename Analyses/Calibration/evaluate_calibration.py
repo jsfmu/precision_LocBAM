@@ -15,7 +15,7 @@ Two voxel sets are reported:
 
 Metrics per calibrator: NLL, Brier, top-label ECE, class-wise ECE (each on all and fg), per-class
 threshold sweeps (precision / recall / Dice of p_k >= t), and argmax Dice. Temperature scaling cannot
-change the argmax, nor can predclass (checked); classwise and vector scaling can, so Dice is reported
+change the argmax, nor can predclass (checked); classwise, isotonic and vector scaling can, so Dice is reported
 per calibrator.
 
 Calibrators fitted with --region pred are two-region: applied only inside the predicted region (raw
@@ -31,6 +31,8 @@ from pathlib import Path
 
 import numpy as np
 from scipy.ndimage import binary_dilation, generate_binary_structure
+
+import isotonic_map as iso
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--cache", required=True, help="data/cache/<hash> folder from cache_logits.py")
@@ -75,6 +77,8 @@ def describe(c):
         s = "T_k=" + ",".join(f"{t:.3f}" for t in c["T_per_class"])
     elif c["method"] == "predclass":
         s = "T_by_pred=" + ",".join(f"{t:.3f}" for t in c["T_by_pred_class"])
+    elif c["method"] == "isotonic":
+        s = "isotonic per (pred class, class)"
     else:
         s = "vector w,b"
     reg = c.get("region", "-")
@@ -95,6 +99,8 @@ def transform(z, cal):
         return z / np.asarray(cal["T_per_class"], dtype=np.float32)[:, None]
     if cal["method"] == "predclass":  # z here is always the RAW logits, so argmax(z) is the raw prediction
         return z / np.asarray(cal["T_by_pred_class"], dtype=np.float32)[z.argmax(axis=0)][None, :]
+    if cal["method"] == "isotonic":  # log of the calibrated probabilities; argmax(z) is the raw prediction
+        return iso.calibrated_scores(z, cal)
     w = np.asarray(cal["w"], dtype=np.float32)[:, None]
     b = np.asarray(cal["b"], dtype=np.float32)[:, None]
     return z * w + b

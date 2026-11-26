@@ -16,6 +16,8 @@ Voxels are subsampled per case (a full volume is ~12M voxels; all of them would 
 --method predclass    one temperature per PREDICTED class: a voxel whose raw argmax is k gets p = softmax(z / T_k).
                       Every voxel is divided by one positive scalar, so the argmax CANNOT change. The T_k are
                       fitted independently (NLL separates by group). Only with --region pred.
+--method isotonic     one monotone curve per (predicted class, class) by isotonic regression, renormalized
+                      (isotonic_map.py). Can bend where a temperature cannot; CAN change the argmax. Only with --region pred.
 --method vector       vector scaling (Guo et al. 2017): p = softmax(w * z + b), one w_k and b_k per class
                       (b_0 fixed to 0, softmax is shift-invariant). CAN change the argmax, so Dice must be re-reported.
 
@@ -33,6 +35,8 @@ from scipy.ndimage import binary_dilation, generate_binary_structure
 from scipy.optimize import minimize, minimize_scalar
 from scipy.special import logsumexp
 
+import isotonic_map as iso
+
 
 def pred_region(logits4d, dilate):
     """(C, X, Y, Z) raw logits -> bool (X, Y, Z): raw argmax != 0, dilated by `dilate` voxels (6-connected)."""
@@ -48,10 +52,10 @@ ap.add_argument("--voxels-per-case", type=int, default=200_000)
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--region", choices=["all", "fg", "pred"], default="all")
 ap.add_argument("--dilate", type=int, default=2, help="--region pred: dilation of the predicted mask, in voxels")
-ap.add_argument("--method", choices=["temperature", "classwise", "predclass", "vector"], default="temperature")
+ap.add_argument("--method", choices=["temperature", "classwise", "predclass", "isotonic", "vector"], default="temperature")
 ap.add_argument("--out", default=None, help="output file name inside --cache")
 a = ap.parse_args()
-assert a.method != "predclass" or a.region == "pred", "--method predclass needs --region pred"
+assert a.method not in ("predclass", "isotonic") or a.region == "pred", f"--method {a.method} needs --region pred"
 cache = Path(a.cache)
 region_tag = f"pred{a.dilate}" if a.region == "pred" else a.region
 out_name = a.out or ("temperature.json" if (a.region, a.method) == ("all", "temperature")
@@ -112,6 +116,13 @@ if a.method == "temperature":
     T = float(np.exp(res.x))
     out.update({"T": T, "nll_fit": nll_scores(Z / T)})
     print(f"T = {T:.4f}   calibration NLL ({a.region}): T=1 {out['nll_T1']:.5f} -> fitted {out['nll_fit']:.5f}")
+elif a.method == "isotonic":
+    params = iso.fit(iso.add_stats(iso.empty_stats(K), iso.softmax(Z.T), Y))
+    S = iso.calibrated_scores(Z.T, params)
+    out.update(params)
+    out["nll_fit"] = float(-S[Y, np.arange(n)].mean())
+    print("isotonic maps fitted; voxels by predicted class:", params["pred_class_counts"])
+    print(f"calibration NLL ({region_tag}): identity {out['nll_T1']:.5f} -> fitted {out['nll_fit']:.5f}")
 elif a.method == "predclass":
     R = Z.argmax(axis=1)
     Ts, counts, total = [], [], 0.0
