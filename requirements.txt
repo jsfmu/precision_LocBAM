@@ -5,3 +5,5 @@ tqdm
 matplotlib
 torch>=1.12
 SimpleITK
+scipy
+ipywidgets
