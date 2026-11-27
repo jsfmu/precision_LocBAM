@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D Calibration Viewer</title>
+<!-- template for build_3d_viewer.py, copied to <cache>/viewer3d/index.html; data comes from cases.js and data/<case>.js -->
+<script src="plotly.min.js"></script>
+<script>if (!window.Plotly) document.write('<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"><\/script>');</script>
+<script src="cases.js"></script>
+<style>
+  :root { --bg:#111418; --panel:#1a1f26; --line:#2c333d; --text:#e6e9ee; --muted:#9aa4b2; --accent:#4ea1ff; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+               font:13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  #app { display:flex; height:100vh; }
+  #side { width:300px; flex:none; overflow-y:auto; background:var(--panel); border-right:1px solid var(--line); padding:12px 14px 24px; }
+  #plot { flex:1; min-width:0; position:relative; }
+  h1 { font-size:15px; margin:0 0 2px; }
+  .sub { color:var(--muted); font-size:11.5px; margin-bottom:10px; }
+  h2 { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:16px 0 6px; font-weight:600; }
+  select, button { font:inherit; color:var(--text); background:#232a33; border:1px solid var(--line); border-radius:5px; padding:4px 7px; }
+  select { width:100%; }
+  button { cursor:pointer; } button:hover { border-color:var(--accent); }
+  button.on { background:var(--accent); border-color:var(--accent); color:#06121f; font-weight:600; }
+  .row { display:flex; align-items:center; gap:6px; margin:3px 0; }
+  .row label { display:flex; align-items:center; gap:6px; cursor:pointer; }
+  .chip { width:12px; height:12px; border-radius:3px; flex:none; border:1px solid rgba(255,255,255,.25); }
+  .seg { display:flex; gap:4px; flex-wrap:wrap; }
+  .seg button { flex:1; padding:3px 4px; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  .slider { display:grid; grid-template-columns:auto 1fr 34px; align-items:center; gap:6px; margin:3px 0; }
+  .slider span:last-child { text-align:right; color:var(--muted); font-variant-numeric:tabular-nums; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  td, th { padding:2px 4px; text-align:right; border-bottom:1px solid var(--line); }
+  td:first-child, th:first-child { text-align:left; }
+  th { color:var(--muted); font-weight:500; }
+  .note { color:var(--muted); font-size:11.5px; margin-top:6px; }
+  .bar { height:10px; border-radius:3px; background:linear-gradient(90deg,#000004,#3b0f70,#8c2981,#de4968,#fe9f6d,#fcfdbf); margin:4px 0 2px; }
+  .ends { display:flex; justify-content:space-between; color:var(--muted); font-size:11px; }
+  #status { position:absolute; top:12px; left:12px; color:var(--muted); background:rgba(0,0,0,.45); padding:4px 8px; border-radius:5px; pointer-events:none; }
+  .disabled { opacity:.4; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <h1>3D calibration viewer</h1>
+    <div class="sub">Drag to rotate · scroll to zoom · right-drag to pan · hover a surface for its value</div>
+
+    <h2>Case</h2>
+    <select id="case"></select>
+    <div class="row" style="margin-top:6px"><button id="prev">◀ prev</button><button id="next">next ▶</button></div>
+    <div id="info"></div>
+
+    <h2>Classes</h2>
+    <div id="classes"></div>
+
+    <h2>Layers</h2>
+    <div id="layers"></div>
+
+    <h2>Probabilities</h2>
+    <div class="seg" id="probs"><button data-v="cal">Calibrated</button><button data-v="raw">Raw</button></div>
+    <div class="note">Used by "Confidence" and "Probability shell". TP / FP / FN colour the outer surface of
+      (truth ∪ prediction) by the voxel just under it; untick one to hide those faces.</div>
+    <div id="shellbox">
+      <div class="row" style="margin-top:8px">Shell threshold t</div>
+      <div class="seg" id="levels"></div>
+    </div>
+    <div id="confkey">
+      <div class="row" style="margin-top:8px">Confidence colour = p(class) just inside the true organ</div>
+      <div class="bar"></div><div class="ends"><span>0 · unsure / missed</span><span>1 · confident</span></div>
+    </div>
+
+    <h2>Appearance</h2>
+    <div class="slider"><span>Surfaces</span><input id="op" type="range" min="0.1" max="1" step="0.05" value="0.9"><span id="opv"></span></div>
+    <div class="slider"><span>Shells</span><input id="sop" type="range" min="0.05" max="1" step="0.05" value="0.35"><span id="sopv"></span></div>
+
+    <h2>CT planes</h2>
+    <div id="planes"></div>
+    <div class="slider"><span>Opacity</span><input id="pop" type="range" min="0.1" max="1" step="0.05" value="1"><span id="popv"></span></div>
+
+    <h2>View from</h2>
+    <div class="seg" id="views"></div>
+
+    <div class="note" style="margin-top:14px">Surfaces are built on the 2× downsampled display grid (3 mm voxels), so very small
+      structures can look different from full resolution. Dice above is the full-resolution value.
+      Axes follow RAS: +x patient right, +y anterior, +z superior.</div>
+  </div>
+  <div id="plot"><div id="status">loading…</div></div>
+</div>
+
+<script>
+const CLS = ["kidney", "tumor", "cyst"];
+const CLS_COLOR = { kidney:"#ff7f0e", tumor:"#1f77b4", cyst:"#9467bd" };
+const LAYERS = [
+  { id:"gt",    label:"Ground truth",            color:null,      note:"class colours" },
+  { id:"pred",  label:"Prediction",              color:null,      note:"class colours" },
+  { id:"tp",    label:"TP · correct",            color:"#2ca02c" },
+  { id:"fp",    label:"FP · false alarm",        color:"#d62728" },
+  { id:"fn",    label:"FN · missed",             color:"#ffd400" },
+  { id:"conf",  label:"Confidence on true organ", color:"magma" },
+  { id:"shell", label:"Probability shell p ≥ t", color:null,      note:"class colours" },
+];
+const LEVELS = ["0.1", "0.25", "0.5", "0.75", "0.9"];
+const MAGMA = [[0,"#000004"],[0.2,"#3b0f70"],[0.4,"#8c2981"],[0.6,"#de4968"],[0.8,"#fe9f6d"],[1,"#fcfdbf"]];
+const S = { classes:new Set(CLS), layers:new Set(["tp","fp","fn"]), probs:"cal", level:"0.5",
+            op:0.9, sop:0.35, pop:1, planes:{ axial:{on:true,i:0}, coronal:{on:false,i:0}, sagittal:{on:false,i:0} } };
+let D = null;               // current case: {info, ct (Uint8Array), layers (decoded lazily)}
+const plotDiv = document.getElementById("plot");
+const status = document.getElementById("status");
+
+// ---------- helpers
+const $ = id => document.getElementById(id);
+function bytes(b64) { const s = atob(b64), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
+function decodeMesh(m) {
+  if (!m || m._d) return m;
+  const f = new Uint32Array(bytes(m.f).buffer), n = f.length / 3;
+  const I = new Uint32Array(n), J = new Uint32Array(n), K = new Uint32Array(n);
+  for (let t = 0; t < n; t++) { I[t] = f[3*t]; J[t] = f[3*t+1]; K[t] = f[3*t+2]; }
+  m._d = { x:new Float32Array(bytes(m.x).buffer), y:new Float32Array(bytes(m.y).buffer), z:new Float32Array(bytes(m.z).buffer), i:I, j:J, k:K, v:{} };
+  if (m.c) {  // per-face error type: majority of the face's three vertex tags (0 TP, 1 FP, 2 FN)
+    const c = bytes(m.c), fc = new Uint8Array(n);
+    for (let t = 0; t < n; t++) { const a = c[I[t]], b = c[J[t]], d = c[K[t]]; fc[t] = (a === b || a === d) ? a : (b === d ? b : a); }
+    m._d.fc = fc;
+  }
+  if (m.v) for (const k in m.v) { const u = bytes(m.v[k]), r = new Float32Array(u.length); for (let t = 0; t < u.length; t++) r[t] = u[t] / 255; m._d.v[k] = r; }
+  return m;
+}
+const LIGHT = { ambient:0.45, diffuse:0.75, specular:0.15, roughness:0.6, fresnel:0.1 };
+function meshTrace(m, name, opts) {
+  m = decodeMesh(m); const d = m._d;
+  return Object.assign({ type:"mesh3d", x:d.x, y:d.y, z:d.z, i:d.i, j:d.j, k:d.k, name, showlegend:false,
+    flatshading:false, lighting:LIGHT, lightposition:{x:1000,y:2000,z:3000}, hovertemplate:name + "<extra></extra>" }, opts);
+}
+
+const ERR = [["#2ca02c", "TP · correct"], ["#d62728", "FP · false alarm"], ["#ffd400", "FN · missed"]];
+function errorTrace(m, c, show) {
+  m = decodeMesh(m); const d = m._d, key = show.join();
+  if (!d.sel || d.sel.key !== key) {  // keep only the faces whose type is ticked
+    const keep = []; for (let t = 0; t < d.fc.length; t++) if (show[d.fc[t]]) keep.push(t);
+    const I = new Uint32Array(keep.length), J = new Uint32Array(keep.length), K = new Uint32Array(keep.length);
+    const fcol = new Array(keep.length), txt = new Array(keep.length);
+    keep.forEach((t, q) => { I[q] = d.i[t]; J[q] = d.j[t]; K[q] = d.k[t]; fcol[q] = ERR[d.fc[t]][0]; txt[q] = ERR[d.fc[t]][1]; });
+    d.sel = { key, I, J, K, fcol, txt };
+  }
+  return { type:"mesh3d", x:d.x, y:d.y, z:d.z, i:d.sel.I, j:d.sel.J, k:d.sel.K, facecolor:d.sel.fcol, opacity:S.op,
+           name:c, showlegend:false, flatshading:false, lighting:LIGHT, lightposition:{x:1000,y:2000,z:3000},
+           hovertemplate:`${c}<extra></extra>` };
+}
+
+// ---------- CT planes
+function planeTrace(kind, idx) {
+  const [nx, ny, nz] = D.info.shape, sp = D.info.spacing_mm, ct = D.ct;
+  const at = (i, j, k) => ct[(i * ny + j) * nz + k];
+  let R, C, f;
+  if (kind === "axial")    { R = ny; C = nx; f = (r, c) => [c, r, idx]; }
+  if (kind === "coronal")  { R = nz; C = nx; f = (r, c) => [c, idx, r]; }
+  if (kind === "sagittal") { R = nz; C = ny; f = (r, c) => [idx, c, r]; }
+  const X = [], Y = [], Z = [], G = [];
+  for (let r = 0; r < R; r++) {
+    const xr = new Array(C), yr = new Array(C), zr = new Array(C), gr = new Array(C);
+    for (let c = 0; c < C; c++) { const [i, j, k] = f(r, c); xr[c] = i*sp; yr[c] = j*sp; zr[c] = k*sp; gr[c] = at(i, j, k); }
+    X.push(xr); Y.push(yr); Z.push(zr); G.push(gr);
+  }
+  return { type:"surface", x:X, y:Y, z:Z, surfacecolor:G, cmin:0, cmax:255, colorscale:[[0,"#000"],[1,"#fff"]],
+           showscale:false, hoverinfo:"skip", opacity:S.pop, name:kind,
+           lighting:{ ambient:1, diffuse:0, specular:0, fresnel:0, roughness:1 } };
+}
+
+// ---------- build all traces from state
+function traces() {
+  const out = [], L = D.layers, cls = CLS.filter(c => S.classes.has(c));
+  for (const c of cls) {
+    if (S.layers.has("gt")   && L.gt[c])   out.push(meshTrace(L.gt[c],   `ground truth ${c}`, { color:CLS_COLOR[c], opacity:S.op }));
+    if (S.layers.has("pred") && L.pred[c]) out.push(meshTrace(L.pred[c], `prediction ${c}`,   { color:CLS_COLOR[c], opacity:S.op }));
+    const show = ["tp","fp","fn"].map(id => S.layers.has(id));
+    if (show.some(Boolean) && L.err[c]) out.push(errorTrace(L.err[c], c, show));
+    if (S.layers.has("conf") && L.conf[c]) {
+      const m = decodeMesh(L.conf[c]);
+      out.push(meshTrace(m, `${c}`, { intensity:m._d.v[S.probs], intensitymode:"vertex", colorscale:MAGMA, cmin:0, cmax:1,
+        showscale:false, opacity:S.op, hovertemplate:`true ${c}<br>${S.probs === "cal" ? "calibrated" : "raw"} p(${c}) = %{intensity:.2f}<extra></extra>` }));
+    }
+    if (S.layers.has("shell")) {
+      const m = L.shell[S.probs][c][S.level];
+      if (m) out.push(meshTrace(m, `${c}: ${S.probs === "cal" ? "calibrated" : "raw"} p ≥ ${S.level}`, { color:CLS_COLOR[c], opacity:S.sop }));
+    }
+  }
+  for (const kind of ["axial","coronal","sagittal"]) if (S.planes[kind].on) out.push(planeTrace(kind, S.planes[kind].i));
+  return out;
+}
+const AX = (t) => ({ title:{ text:t, font:{ size:11, color:"#9aa4b2" } }, color:"#9aa4b2", gridcolor:"#2c333d",
+                     zerolinecolor:"#2c333d", backgroundcolor:"#111418", showbackground:true, showspikes:false });
+const layout = { paper_bgcolor:"#111418", margin:{ l:0, r:0, t:0, b:0 }, uirevision:"keep",
+  scene:{ aspectmode:"data", xaxis:AX("x → patient right (mm)"), yaxis:AX("y → anterior (mm)"), zaxis:AX("z → superior (mm)"),
+          camera:{ eye:{ x:0, y:2.0, z:0.35 }, up:{ x:0, y:0, z:1 } } } };
+let pending = false;
+function render() {
+  if (!D || pending) return; pending = true;
+  requestAnimationFrame(() => { pending = false; Plotly.react(plotDiv, traces(), layout, { responsive:true, displaylogo:false }); });
+}
+
+// ---------- side panel
+function info() {
+  const i = D.info, dice = i.dice || {};
+  const f = v => (v === null || v === undefined) ? "–" : v.toFixed(3);
+  let h = `<table style="margin-top:8px"><tr><th></th><th>Dice</th><th>GT vox</th><th>pred vox</th></tr>`;
+  for (const c of CLS) h += `<tr><td><span class="chip" style="display:inline-block;vertical-align:-1px;background:${CLS_COLOR[c]}"></span> ${c}</td>
+    <td>${f(dice[c])}</td><td>${i.voxels[c].gt}</td><td>${i.voxels[c].pred}</td></tr>`;
+  $("info").innerHTML = h + `</table><div class="note">Dice: full resolution, identical raw/calibrated. Voxel counts: display grid (${i.spacing_mm} mm).</div>`;
+}
+function buildPanel() {
+  $("classes").innerHTML = CLS.map(c => `<div class="row"><label><input type="checkbox" data-c="${c}" ${S.classes.has(c) ? "checked" : ""}>
+    <span class="chip" style="background:${CLS_COLOR[c]}"></span>${c}</label></div>`).join("");
+  $("classes").onchange = e => { const c = e.target.dataset.c; e.target.checked ? S.classes.add(c) : S.classes.delete(c); render(); };
+  $("layers").innerHTML = LAYERS.map(l => {
+    const chip = l.color === "magma" ? `<span class="chip" style="background:linear-gradient(90deg,#000004,#de4968,#fcfdbf)"></span>`
+      : l.color ? `<span class="chip" style="background:${l.color}"></span>`
+      : `<span class="chip" style="background:linear-gradient(90deg,#ff7f0e 33%,#1f77b4 33% 66%,#9467bd 66%)"></span>`;
+    return `<div class="row"><label><input type="checkbox" data-l="${l.id}" ${S.layers.has(l.id) ? "checked" : ""}>${chip}${l.label}</label></div>`;
+  }).join("");
+  $("layers").onchange = e => { const l = e.target.dataset.l; e.target.checked ? S.layers.add(l) : S.layers.delete(l); sync(); render(); };
+  seg("probs", v => S.probs = v, () => S.probs);
+  $("levels").innerHTML = LEVELS.map(t => `<button data-v="${t}">${t}</button>`).join("");
+  seg("levels", v => S.level = v, () => S.level);
+  for (const [id, key] of [["op","op"],["sop","sop"],["pop","pop"]]) {
+    const el = $(id), lab = $(id + "v"); lab.textContent = (+el.value).toFixed(2);
+    el.oninput = () => { S[key] = +el.value; lab.textContent = S[key].toFixed(2); render(); };
+  }
+  const views = { Front:{x:0,y:2,z:0.35}, Back:{x:0,y:-2,z:0.35}, "Pt right":{x:2,y:0,z:0.35}, "Pt left":{x:-2,y:0,z:0.35}, Top:{x:0,y:0.01,z:2.2}, Bottom:{x:0,y:0.01,z:-2.2} };
+  $("views").innerHTML = Object.keys(views).map(k => `<button data-v="${k}">${k}</button>`).join("");
+  $("views").onclick = e => { const k = e.target.dataset.v; if (!k) return;
+    Plotly.relayout(plotDiv, { "scene.camera": { eye:views[k], up:{ x:0, y:0, z:1 }, center:{ x:0, y:0, z:0 } } }); };
+  sync();
+}
+function seg(id, set, get) {
+  const el = $(id);
+  el.onclick = e => { const v = e.target.dataset.v; if (!v) return; set(v); mark(el, get()); render(); };
+  mark(el, get());
+}
+function mark(el, v) { for (const b of el.querySelectorAll("button")) b.classList.toggle("on", b.dataset.v === v); }
+function sync() {
+  $("shellbox").classList.toggle("disabled", !S.layers.has("shell"));
+  $("confkey").style.display = S.layers.has("conf") ? "" : "none";
+  $("probs").classList.toggle("disabled", !(S.layers.has("shell") || S.layers.has("conf")));
+}
+function buildPlanes() {
+  const [nx, ny, nz] = D.info.shape, max = { axial:nz - 1, coronal:ny - 1, sagittal:nx - 1 };
+  $("planes").innerHTML = ["axial","coronal","sagittal"].map(k => `<div class="slider">
+    <label><input type="checkbox" data-p="${k}" ${S.planes[k].on ? "checked" : ""}> ${k}</label>
+    <input type="range" data-p="${k}" min="0" max="${max[k]}" value="${S.planes[k].i}"><span id="pv-${k}">${S.planes[k].i}</span></div>`).join("");
+  $("planes").oninput = e => { const k = e.target.dataset.p; if (!k) return;
+    if (e.target.type === "checkbox") S.planes[k].on = e.target.checked;
+    else { S.planes[k].i = +e.target.value; $("pv-" + k).textContent = e.target.value; if (!S.planes[k].on) { S.planes[k].on = true; $("planes").querySelector(`input[type=checkbox][data-p=${k}]`).checked = true; } }
+    render(); };
+}
+
+// ---------- case loading (script injection works from file://, fetch does not)
+window.__case_loaded = (p) => {
+  p.ct = bytes(p.ct); D = p;
+  const [nx, ny, nz] = p.info.shape;
+  // centre the planes on the organs (ground truth, else prediction), else on the volume
+  let lo = [Infinity, Infinity, Infinity], hi = [-1, -1, -1];
+  for (const c of CLS) for (const src of [p.layers.gt[c], p.layers.pred[c]]) if (src) {
+    const d = decodeMesh(src)._d, sp = p.info.spacing_mm;
+    for (const [a, arr] of [[0, d.x], [1, d.y], [2, d.z]]) for (let t = 0; t < arr.length; t += 7) { const v = arr[t] / sp; if (v < lo[a]) lo[a] = v; if (v > hi[a]) hi[a] = v; }
+  }
+  const mid = (a, n) => hi[a] >= 0 ? Math.round((lo[a] + hi[a]) / 2) : Math.floor(n / 2);
+  S.planes.axial.i = mid(2, nz); S.planes.coronal.i = mid(1, ny); S.planes.sagittal.i = mid(0, nx);
+  info(); buildPlanes(); status.style.display = "none"; render();
+};
+function loadCase(cid) {
+  status.style.display = ""; status.textContent = `loading ${cid}…`;
+  const old = document.getElementById("casedata"); if (old) old.remove();
+  const s = document.createElement("script"); s.id = "casedata"; s.src = `data/${cid}.js`;
+  s.onerror = () => { status.textContent = `could not load data/${cid}.js`; };
+  document.body.appendChild(s);
+  try { history.replaceState(null, "", "#" + cid); } catch (e) {}
+}
+
+// ---------- start
+(function () {
+  if (typeof Plotly === "undefined") { status.textContent = "plotly.js did not load (needs internet the first time)"; return; }
+  const cases = window.CASES || [];
+  if (!cases.length) { status.textContent = "no cases: run build_3d_viewer.py"; return; }
+  const sel = $("case");
+  const f = v => (v === null || v === undefined) ? "–" : v.toFixed(2);
+  sel.innerHTML = cases.map(c => `<option value="${c.case}">${c.case}  ·  tumor Dice ${f(c.dice && c.dice.tumor)}</option>`).join("");
+  sel.onchange = () => loadCase(sel.value);
+  const step = d => { const i = sel.selectedIndex + d; if (i >= 0 && i < cases.length) { sel.selectedIndex = i; loadCase(sel.value); } };
+  $("prev").onclick = () => step(-1); $("next").onclick = () => step(1);
+  buildPanel();
+  const want = decodeURIComponent(location.hash.slice(1));
+  if (cases.some(c => c.case === want)) sel.value = want;
+  loadCase(sel.value);
+})();
+</script>
+</body>
+</html>
